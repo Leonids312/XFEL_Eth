@@ -1,0 +1,46 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+
+# Machine-specific settings and credentials
+/.xfel*.json
+.env
+.env.*
+*.pem
+*.key
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store
+
+# Experimental data, saved projects, generated output, and archives
+/output/
+/tmp/
+/*_area_review_*/
+*.xfel.json
+*.hdf5
+*.h5
+*.tif
+*.tiff
+*.png
+*.jpg
+*.jpeg
+*.xlsx
+*.xls
+*.csv
+*.log
+*.zip
+*.7z
+*.bak
+
+# Dataset-specific one-off scripts, not required by the desktop application
+/grazing_manual_statistics.py
+/处理代码/
