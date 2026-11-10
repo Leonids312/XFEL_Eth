@@ -12,6 +12,7 @@ dist/
 
 # Machine-specific settings and credentials
 /.xfel*.json
+*.baiduyun.uploading.cfg
 .env
 .env.*
 *.pem

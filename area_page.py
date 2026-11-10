@@ -6,6 +6,8 @@ import math
 import json
 import os
 import re
+import queue
+import threading
 import tkinter as tk
 import tkinter.font as tkfont
 from collections import OrderedDict
@@ -18,10 +20,14 @@ import cv2
 import numpy as np
 from PIL import Image, ImageTk
 
+from area_detection import METHODS, measure_image, read_native_rgb, resolve_method, spot_bounds
 from xfel_core import ProjectState, RecentPathStore, attenuation_sort_key
 
 
 IMAGE_EXTENSIONS = {".tif", ".tiff", ".png", ".jpg", ".jpeg", ".bmp"}
+LAYOUT_LABELS = {"normal": "正入射网格", "grazing": "掠入射上下分行", "grazing_columns": "掠入射左右分列"}
+GRAZING_LAYOUTS = {"grazing", "grazing_columns"}
+DIRECTION_LABELS = {"TTB": "上→下", "BTT": "下→上", "LTR": "左→右", "RTL": "右→左"}
 
 
 def natural_key(text: str) -> list[tuple[int, float | str]]:
@@ -63,8 +69,8 @@ def mapped_serial(row: int, col: int, total_cols: int, column_order: str, row_di
 
 
 def mapped_grazing_serial(serial: int, range_min: int, range_max: int, direction: str) -> int:
-    """Map a physical top-to-bottom strip index to its grazing-incidence serial."""
-    return serial if direction == "TTB" else range_min + range_max - serial
+    """Map a physical strip (top-down or left-right) to its grazing serial."""
+    return range_min + range_max - serial if direction in {"BTT", "RTL"} else serial
 
 
 @dataclass
@@ -86,6 +92,8 @@ class ImageEntry:
     display_rows: int
     display_cols: int
     layout: str = "normal"
+    publish: bool = True
+    manual_start: int | None = None
 
     @property
     def name(self) -> str:
@@ -109,6 +117,52 @@ class ProcessingParameters:
     max_area_px: float = 100000.0
     median_blur: int = 3
     close_kernel: int = 5
+    method: str = "threshold"
+    gap_px: int = 6
+    sensitivity: float = 3.0
+    pit_gap_px: int = 14
+
+
+def mapped_image_entry(path: Path, root: Path, layout: str, mapping: dict[str, Any]) -> ImageEntry:
+    """Explicit geometry for names without complete metadata. Preview does not create pulse records."""
+    if layout not in LAYOUT_LABELS:
+        raise ValueError("未知点位布局")
+    publish = mapping.get("publish") is True
+    attens = [s.strip() for s in re.split(r"[,，&、;；]", str(mapping.get("attens", ""))) if s.strip()]
+    if not attens and not publish:
+        attens = ["未指定"]
+    if not attens or len(set(attens)) != len(attens) or (layout in GRAZING_LAYOUTS and len(attens) != 1):
+        raise ValueError("请填写不重复的衰减倍数，掠入射每张图只用一个倍数。")
+    if any(not re.fullmatch(r"\d+(?:\.\d+)?", a) for a in attens) and (publish or attens != ["未指定"]):
+        raise ValueError("衰减倍数应为非负数；仅预览可留空。")
+    start, count, rows = (int(mapping[key]) for key in ("start", "count", "rows"))
+    if layout in GRAZING_LAYOUTS:
+        rows = 1
+    if start < 1 or count < 1 or rows < 1 or rows * count * len(attens) > 10000:
+        raise ValueError("起始序号、坑位数和行数必须为正整数；每张图不超过 10000 个坑位。")
+    rel = os.path.relpath(path, root)
+    spots = []
+    for group, atten in enumerate(attens):
+        for r in range(rows):
+            for c in range(count):
+                serial = start + r * count + c
+                dr, dc = ((c+1, 1) if layout == "grazing" else (group * rows + r + 1, c+1))
+                # Manual UIDs describe physical cells, independent of experimental labels.
+                uid = f"{rel}#cell:{layout}:{len(attens) * rows}x{count}:{dr}:{dc}"
+                spots.append(Spot(atten, serial, r + 1, (start+c if layout in GRAZING_LAYOUTS else c+1), dr, dc, uid))
+    nr, nc = ((count, 1) if layout == "grazing" else (rows * len(attens), count))
+    return ImageEntry(path, rel, spots, nr, nc, layout, publish, start)
+
+
+def compact_layout_hint(stem: str) -> dict[str, Any] | None:
+    """'atten_0&3-num1-5' does not encode the number of rows per group. Preview only."""
+    m = re.search(r"atten[_\s]*(\d+(?:\.\d+)?(?:&\d+(?:\.\d+)?)*)[-_]num[_\s]*(\d+)-(\d+)$", stem, re.I)
+    if not m:
+        return None
+    lo, hi = map(int, m.groups()[1:])
+    if lo < 1 or hi < lo:
+        return None
+    return {"attens": m[1].replace("&", ","), "start": lo, "count": hi-lo+1, "rows": 2, "publish": False}
 
 
 def parse_image_name(
@@ -141,19 +195,22 @@ def parse_image_name(
                 for display_col, col in enumerate(cols, 1):
                     spots.append(Spot(atten, 0, row, col, display_row, display_col))
         display_rows, display_cols = len(attens) * len(rows), len(cols)
-    elif no_pattern and (infer_missing_l or segmentation_mode == "grazing"):
+    elif no_pattern and (infer_missing_l or segmentation_mode in GRAZING_LAYOUTS):
         atten = no_pattern.group("atten")
         start, end = int(no_pattern.group("start")), int(no_pattern.group("end"))
         serials = list(range(start, end + (1 if end >= start else -1), 1 if end >= start else -1))
-        if segmentation_mode == "grazing":
-            layout = "grazing"
-            for display_row, serial in enumerate(serials, 1):
-                spots.append(Spot(atten, 0, 1, serial, display_row, 1))
-            display_rows, display_cols = len(serials), 1
+        if segmentation_mode in GRAZING_LAYOUTS:
+            layout = segmentation_mode
+            for index, serial in enumerate(serials, 1):
+                dr, dc = (index, 1) if layout == "grazing" else (1, index)
+                spots.append(Spot(atten, 0, 1, serial, dr, dc))
+            display_rows, display_cols = (len(serials), 1) if layout == "grazing" else (1, len(serials))
         else:
             for display_col, serial in enumerate(serials, 1):
                 spots.append(Spot(atten, 0, 1, serial, 1, display_col))
             display_rows, display_cols = 1, len(serials)
+    elif segmentation_mode == "normal" and (hint := compact_layout_hint(stem)):
+        return mapped_image_entry(path, root, "normal", hint)
     else:
         return None
     rel_path = os.path.relpath(path, root)
@@ -215,11 +272,15 @@ class AreaAnalysisPage(ttk.Frame):
         self.entries: list[ImageEntry] = []
         self.current_entry: ImageEntry | None = None
         self.results: dict[str, dict[str, Any]] = {}
+        self.manual_mappings: dict[str, dict[str, dict[str, Any]]] = {}
+        self.inactive_results: dict[str, dict[str, Any]] = {}
+        self.loaded_layout = "normal"
         self.directions: dict[str, str] = {}
         self.candidate_cache: dict[str, list[Candidate]] = {}
         self.mask_cache: dict[str, np.ndarray] = {}
         self.image_cache: OrderedDict[str, np.ndarray] = OrderedDict()
         self.params = ProcessingParameters()
+        self._analysis_cancel: threading.Event | None = None
         self.scale_um_per_px: float | None = None
         self.scale_line: tuple[tuple[int, int], tuple[int, int]] | None = None
         self.draw_points: list[tuple[int, int]] = []
@@ -242,6 +303,9 @@ class AreaAnalysisPage(ttk.Frame):
         self.mode_var = tk.StringVar(value="browse")
         self.segmentation_mode_var = tk.StringVar(value="normal")
         self.column_order_var = tk.StringVar(value="LTR")
+        self._applied_column_order = "LTR"
+        self._sync_conflicts: set[tuple[str, int]] = set()
+        self._sync_kept = 0
         self.show_mask_var = tk.BooleanVar(value=False)
         self.show_contours_var = tk.BooleanVar(value=True)
         self.infer_missing_l_var = tk.BooleanVar(value=True)
@@ -252,6 +316,11 @@ class AreaAnalysisPage(ttk.Frame):
         self.max_area_var = tk.DoubleVar(value=self.params.max_area_px)
         self.blur_var = tk.IntVar(value=self.params.median_blur)
         self.close_var = tk.IntVar(value=self.params.close_kernel)
+        self.method_var = tk.StringVar(value=METHODS[self.params.method])
+        self.gap_var = tk.IntVar(value=self.params.gap_px)
+        self.pit_gap_var = tk.IntVar(value=self.params.pit_gap_px)
+        self.sensitivity_var = tk.DoubleVar(value=self.params.sensitivity)
+        self.detail_var = tk.StringVar()
         self.scale_length_var = tk.DoubleVar(value=80.0)
         self.contour_color_var = tk.StringVar(value="#22c55e")
         self.contour_width_var = tk.IntVar(value=2)
@@ -275,16 +344,15 @@ class AreaAnalysisPage(ttk.Frame):
         toolbar.pack(fill=tk.X)
         ttk.Button(toolbar, text="选择图像文件夹", command=self.choose_folder).pack(side=tk.LEFT)
         ttk.Button(toolbar, text="导入旧面积存档", command=self.import_legacy_project).pack(side=tk.LEFT, padx=(5, 0))
-        ttk.Entry(toolbar, textvariable=self.folder_var, width=52, state="readonly").pack(side=tk.LEFT, padx=6)
-        ttk.Label(toolbar, text="分割模式").pack(side=tk.LEFT, padx=(4, 2))
-        ttk.Radiobutton(
-            toolbar, text="正入射", variable=self.segmentation_mode_var, value="normal",
-            command=self.on_segmentation_mode_changed,
-        ).pack(side=tk.LEFT)
-        ttk.Radiobutton(
-            toolbar, text="掠入射", variable=self.segmentation_mode_var, value="grazing",
-            command=self.on_segmentation_mode_changed,
-        ).pack(side=tk.LEFT, padx=(3, 0))
+        ttk.Entry(toolbar, textvariable=self.folder_var, width=32, state="readonly").pack(side=tk.LEFT, padx=6)
+        ttk.Label(toolbar, text="点位布局").pack(side=tk.LEFT, padx=(4, 2))
+        self.layout_menu = ttk.Menubutton(toolbar, text=LAYOUT_LABELS["normal"])
+        layout_choices = tk.Menu(self.layout_menu, tearoff=False)
+        for code, label in LAYOUT_LABELS.items():
+            layout_choices.add_radiobutton(label=label, variable=self.segmentation_mode_var, value=code,
+                                          command=self.on_segmentation_mode_changed)
+        self.layout_menu.configure(menu=layout_choices)
+        self.layout_menu.pack(side=tk.LEFT)
         ttk.Checkbutton(toolbar, text="兼容缺省 L=1 文件名", variable=self.infer_missing_l_var, command=self.reload_folder).pack(side=tk.LEFT)
         ttk.Button(toolbar, text="处理当前", command=self.process_current).pack(side=tk.LEFT, padx=(8, 3))
         ttk.Button(toolbar, text="处理全部", command=self.process_all).pack(side=tk.LEFT, padx=3)
@@ -300,7 +368,10 @@ class AreaAnalysisPage(ttk.Frame):
         body.add(center, weight=1)
         body.add(right, weight=0)
 
-        ttk.Label(left, text="图像文件", font=("Microsoft YaHei UI", 10, "bold")).pack(anchor=tk.W)
+        file_header = ttk.Frame(left)
+        file_header.pack(fill=tk.X)
+        ttk.Label(file_header, text="图像文件", font=("Microsoft YaHei UI", 10, "bold")).pack(side=tk.LEFT)
+        ttk.Button(file_header, text="添加/设置点位…", command=self.choose_manual_mapping).pack(side=tk.RIGHT)
         self.file_list = tk.Listbox(left, width=31, exportselection=False)
         self.file_list.pack(fill=tk.BOTH, expand=True, pady=(5, 8))
         self.file_list.bind("<<ListboxSelect>>", self._on_file_select)
@@ -369,26 +440,76 @@ class AreaAnalysisPage(ttk.Frame):
         ttk.Spinbox(parent, textvariable=variable, from_=low, to=high, width=12).grid(row=row, column=1, sticky=tk.E, pady=3)
 
     def _build_process_tab(self, tab: ttk.Frame) -> None:
-        self._spin(tab, 0, "灰度下限", self.gray_low_var, 0, 255)
-        self._spin(tab, 1, "灰度上限", self.gray_high_var, 0, 255)
-        ttk.Checkbutton(tab, text="亮损伤模式（灰度反转）", variable=self.bright_var).grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=5)
-        self._spin(tab, 3, "最小面积 (px²)", self.min_area_var, 0, 1e9)
-        self._spin(tab, 4, "最大面积 (px²)", self.max_area_var, 0, 1e9)
-        self._spin(tab, 5, "中值滤波核", self.blur_var, 1, 31)
-        self._spin(tab, 6, "闭运算核", self.close_var, 1, 51)
-        ttk.Checkbutton(tab, text="显示二值图", variable=self.show_mask_var, command=lambda: self.render_canvas(True)).grid(row=7, column=0, columnspan=2, sticky=tk.W, pady=(8, 2))
+        ttk.Label(tab, text="面积识别方法（与点位排布独立）").grid(row=0, columnspan=2, sticky=tk.W)
+        method_box = ttk.Combobox(tab, values=list(METHODS.values()), textvariable=self.method_var, state="readonly")
+        method_box.grid(row=1, column=0, columnspan=2, sticky=tk.EW, pady=(3, 6))
+        method_box.bind("<<ComboboxSelected>>", self._method_changed)
+        old = self.threshold_controls = ttk.Frame(tab)
+        old.grid(row=2, column=0, columnspan=2, sticky=tk.EW)
+        self._spin(old, 0, "灰度下限", self.gray_low_var, 0, 255)
+        self._spin(old, 1, "灰度上限", self.gray_high_var, 0, 255)
+        ttk.Checkbutton(old, text="亮损伤模式（灰度反转）", variable=self.bright_var).grid(row=2, columnspan=2, sticky=tk.W)
+        self._spin(old, 3, "最小面积 (px²)", self.min_area_var, 0, 1e9)
+        self._spin(old, 4, "最大面积 (px²)", self.max_area_var, 0, 1e9)
+        self._spin(old, 5, "中值滤波核", self.blur_var, 1, 31)
+        self._spin(old, 6, "闭运算核", self.close_var, 1, 51)
+        ttk.Checkbutton(old, text="显示阈值二值图", variable=self.show_mask_var, command=lambda: self.render_canvas(True)).grid(row=7, columnspan=2, sticky=tk.W)
+        new = self.edge_controls = ttk.Frame(tab)
+        new.grid(row=2, column=0, columnspan=2, sticky=tk.EW)
+        self._spin(new, 0, "明暗坑可补缺口 (原图 px)", self.pit_gap_var, 0, 64)
+        self._spin(new, 1, "DIC 可补缺口 (原图 px)", self.gap_var, 0, 64)
+        self._spin(new, 2, "信号门槛（越高越严格）", self.sensitivity_var, 1, 12)
+        ttk.Label(new, wraplength=285, foreground="#475569", text="新方法在各坑位原图中识别；上下分区查找横条，左右分区查找竖条。证据不足时只标待复核，面积留空。").grid(row=3, columnspan=2, sticky=tk.W, pady=6)
+        new.grid_remove()
         ttk.Checkbutton(tab, text="显示轮廓", variable=self.show_contours_var, command=self.redraw_overlay).grid(row=8, column=0, columnspan=2, sticky=tk.W)
         ttk.Button(tab, text="应用并处理当前", command=self.process_current).grid(row=9, column=0, columnspan=2, sticky=tk.EW, pady=(10, 3))
         ttk.Button(tab, text="应用并处理全部", command=self.process_all).grid(row=10, column=0, columnspan=2, sticky=tk.EW)
-        ttk.Label(tab, text="自动识别默认选择每个网格中面积最大的候选轮廓。", wraplength=300, foreground="#475569").grid(row=11, column=0, columnspan=2, sticky=tk.W, pady=(12, 0))
+        ttk.Button(tab, text="停止批处理", command=self.stop_analysis).grid(row=11, columnspan=2, sticky=tk.EW)
+        ttk.Button(tab, text="查看当前坑位 RGB 截面…", command=self.open_profile).grid(row=12, columnspan=2, sticky=tk.EW, pady=5)
+        ttk.Label(tab, textvariable=self.detail_var, wraplength=285, foreground="#475569").grid(row=13, columnspan=2, sticky=tk.W)
+
+    def _method_key(self):
+        return next((k for k, label in METHODS.items() if label == self.method_var.get()), "threshold")
+
+    def _method_changed(self, event=None):
+        if self._method_key() == "threshold":
+            self.edge_controls.grid_remove()
+            self.threshold_controls.grid()
+        else:
+            self.threshold_controls.grid_remove()
+            self.edge_controls.grid()
+            self.show_mask_var.set(False)
+        if event is not None:
+            self.stop_analysis()
+            self.candidate_cache.clear()
+            self.render_canvas(True)
+            self.state.notify("area_parameters")
+
+    def open_profile(self):
+        entry, spot = self.current_entry, self.selected_spot()
+        if not entry or not spot:
+            messagebox.showinfo("截面", "请先选中图像和坑位。", parent=self)
+            return
+        try:
+            from area_profile import show_profile
+            rgb = read_native_rgb(entry.path)
+            x0, y0, x1, y1 = spot_bounds(*rgb.shape[:2], entry.display_rows, entry.display_cols, spot.display_row, self.spot_display_col(entry, spot))
+            axis = "horizontal" if entry.layout == "grazing" else "vertical"
+            result = self.results.get(spot.uid, {})
+            show_profile(self, f"{entry.name} · {spot.atten}倍 no.{spot.serial}",
+                         rgb[y0:y1, x0:x1].copy(), (x0, y0), axis, result.get("contour"), result.get("paths", ()))
+        except Exception as exc:
+            messagebox.showerror("截面读取失败", str(exc), parent=self)
 
     def _build_spots_tab(self, tab: ttk.Frame) -> None:
-        self.spot_tree = ttk.Treeview(tab, columns=("atten", "serial", "area", "status"), show="headings", height=20)
+        self.spot_tree = ttk.Treeview(tab, columns=("atten", "serial", "area", "status"), show="headings", height=14)
         for column, title, width in (("atten", "衰减", 58), ("serial", "序号", 55), ("area", "面积", 92), ("status", "状态", 78)):
             self.spot_tree.heading(column, text=title)
             self.spot_tree.column(column, width=width, anchor=tk.CENTER, stretch=False)
         self.spot_tree.pack(fill=tk.BOTH, expand=True)
         self.spot_tree.bind("<<TreeviewSelect>>", self._spot_select)
+        ttk.Label(tab, textvariable=self.detail_var, wraplength=285, foreground="#475569").pack(fill=tk.X)
+        ttk.Button(tab, text="修正现有轮廓 / 待复核边线…", command=self.edit_selected_contour).pack(fill=tk.X, pady=(5, 2))
         ttk.Button(tab, text="设为无损伤（面积 0）", command=self.mark_no_damage).pack(fill=tk.X, pady=(8, 3))
         ttk.Button(tab, text="图像截断（不统计）", command=self.mark_truncated).pack(fill=tk.X, pady=3)
         ttk.Radiobutton(tab, text="点击自动候选轮廓", variable=self.mode_var, value="pick").pack(anchor=tk.W, pady=2)
@@ -470,6 +591,11 @@ class AreaAnalysisPage(ttk.Frame):
         }
 
     def set_status(self, text: str) -> None:
+        if self._sync_conflicts:
+            a,n = min(self._sync_conflicts)
+            text += f"　另有 {len(self._sync_conflicts)} 个点位与既有图源冲突（如 {a}倍 no.{n}），未覆盖。"
+        if self._sync_kept:
+            text += f"　有 {self._sync_kept} 个点在此布局无可用面积，第 3 步保留此前的测量。"
         self.status_var.set(text)
         self.status_callback(text)
         self.update_idletasks()
@@ -507,43 +633,171 @@ class AreaAnalysisPage(ttk.Frame):
         self.set_status(f"已导入旧面积存档：{filename}，数据已同步到第 3 步。")
 
     def reload_folder(self) -> None:
-        if self.root_dir:
+        if self.root_dir and self.root_dir.is_dir():
             saved = self.export_config()
             self.load_folder(self.root_dir, saved)
+
+    def choose_manual_mapping(self) -> None:
+        if self.root_dir is None or not self.root_dir.is_dir():
+            messagebox.showinfo("尚未选择文件夹", "请先选择图像文件夹，再添加或设置其中一张原图。", parent=self)
+            return
+        initial = self.path_store.initial_dir("area_map_image", self.root_dir) if self.path_store else self.root_dir
+        name = filedialog.askopenfilename(parent=self, title="为当前文件夹内的图像设置点位", initialdir=initial,
+                                          filetypes=[("显微图像", "*.tif *.tiff *.png *.bmp *.jpg *.jpeg")])
+        if not name:
+            return
+        path = Path(name)
+        if path.parent.resolve() != self.root_dir.resolve():
+            messagebox.showerror("文件夹不匹配", "请先选择该图像所在的文件夹。", parent=self)
+            return
+        if self.path_store:
+            self.path_store.remember_file("area_map_image", name)
+        layout = self.loaded_layout
+        existing = next((e for e in self.entries if e.name == path.name), None)
+        spec = self.manual_mappings.get(layout, {}).get(path.name)
+        if not spec:
+            if existing and existing.layout == layout:
+                attens = list(dict.fromkeys(s.atten for s in existing.spots))
+                spec = {"attens": ",".join(attens), "start": min(s.serial for s in existing.spots),
+                        "rows": (existing.display_rows // len(attens) if layout == "normal" else 1),
+                        "count": existing.display_rows if layout == "grazing" else existing.display_cols,
+                        "publish": existing.publish}
+            else:
+                spec = {"attens": "", "start": 1, "rows": 1, "count": 1, "publish": False}
+        dialog = tk.Toplevel(self)
+        dialog.title("点位布局与实验编号")
+        dialog.transient(self.winfo_toplevel())
+        box = ttk.Frame(dialog, padding=12)
+        box.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(box, text=f"{path.name}　·　{LAYOUT_LABELS[layout]}").grid(row=0, columnspan=2, sticky="w")
+        fields = {}
+        descriptions = {"attens": "衰减倍数（正入射可逗号分隔）", "start": "每组的起始序号",
+                        "count": ("每组条纹总数" if layout in GRAZING_LAYOUTS else "每行点数"),
+                        "rows": "每个衰减组的行数"}
+        for index, (key, label) in enumerate(descriptions.items(), 1):
+            fields[key] = tk.StringVar(dialog, value=spec[key])
+            if layout in GRAZING_LAYOUTS and key == "rows":
+                continue
+            ttk.Label(box, text=label).grid(row=index, column=0, sticky="w", pady=3)
+            ttk.Entry(box, textvariable=fields[key], width=15).grid(row=index, column=1, pady=3)
+        publish = tk.BooleanVar(dialog, value=spec.get("publish") is True)
+        ttk.Checkbutton(box, text="已核实点位、编号与衰减组，作为脉冲同步到第 3 步", variable=publish).grid(row=5, columnspan=2, sticky="w")
+        ttk.Label(box, text="不勾选只预览/比较，不产生能量表记录；同一视野不同偏置只同步一张。\n"
+                            "未编码行数的 num 文件先按每组 2 行预览，请按原图核实。数序方向在左侧按组设置。",
+                  foreground="#475569", wraplength=410).grid(row=6, columnspan=2, sticky="w", pady=5)
+
+        def apply() -> None:
+            mapping = {k: v.get().strip() for k, v in fields.items()}
+            mapping["publish"] = publish.get()
+            try:
+                candidate = mapped_image_entry(path, self.root_dir, layout, mapping)
+                changed = self._set_manual_mapping(candidate, mapping)
+            except (ValueError, OSError) as exc:
+                messagebox.showerror("未更改点位", str(exc), parent=dialog)
+                return
+            if changed:
+                dialog.destroy()
+        ttk.Button(box, text="应用", command=apply).grid(row=7, column=0, sticky="e")
+        ttk.Button(box, text="取消", command=dialog.destroy).grid(row=7, column=1, sticky="w", padx=5)
+        dialog.grab_set()
+
+    def _set_manual_mapping(self, candidate: ImageEntry, mapping: dict[str, Any]) -> bool:
+        """Only publish verified, non-overlapping pulse identities; never renumber energy measurements."""
+        keys = {(s.atten, s.serial) for s in candidate.spots} if candidate.publish else set()
+        existing = next((e for e in self.entries if e.path == candidate.path), None)
+        other_keys = {(s.atten, s.serial) for e in self.entries if e.publish and e is not existing for s in e.spots}
+        same_image = []
+        for record in self.state.records.values():
+            if not record.image_path:
+                continue
+            if Path(record.image_path) == candidate.path:
+                same_image.append(record)
+            else:
+                other_keys.add((record.atten, record.serial))
+        if keys & other_keys:
+            atten, serial = sorted(keys & other_keys)[0]
+            raise ValueError(f"{atten} 倍 no.{serial} 已由另一张图占用。同一视野不同偏置请仅选择一张正式同步；"
+                             "可先将原图改成仅预览，再启用另一张。")
+        # A new preview mapping does not revoke this file's already published
+        # measurements in a different orientation.
+        retired = [r for r in same_image if (r.atten, r.serial) not in keys and
+                   (candidate.publish or (existing is not None and existing.publish and
+                    (r.image_display_rows, r.image_display_cols) == (existing.display_rows, existing.display_cols)))]
+        resized = existing is not None and (
+            existing.layout, existing.display_rows, existing.display_cols
+        ) != (candidate.layout, candidate.display_rows, candidate.display_cols)
+        if (retired or (resized and any(s.uid in self.results for s in existing.spots))) and not messagebox.askyesno(
+            "确认更改点位", "旧布局中不再对应的面积/轮廓将从当前布局撤下，不会改动能量数据。继续？", parent=self,
+        ):
+            return False
+        saved = self.export_config()
+        results = dict(saved["results"])
+        if existing:
+            cached = {(s.display_row, s.display_col): results.pop(s.uid, None) for s in existing.spots}
+            if not resized:
+                for s in candidate.spots:
+                    if (value := cached.get((s.display_row, s.display_col))) is not None:
+                        results[s.uid] = value
+        saved["results"] = results
+        saved["manual_mappings"].setdefault(candidate.layout, {})[candidate.name] = mapping
+        for r in retired:
+            self._retire_image_area(r)
+        self.load_folder(self.root_dir, saved)
+        index = next(i for i, entry in enumerate(self.entries) if entry.path == candidate.path)
+        self.file_list.selection_clear(0, tk.END)
+        self.file_list.selection_set(index)
+        self.file_list.see(index)
+        self.select_entry(self.entries[index])
+        self.set_status("点位设置已保存到当前项目。" + ("已按实验编号同步。" if candidate.publish else "仅供比较，不会同步到能量表。"))
+        return True
 
     def on_segmentation_mode_changed(self) -> None:
         """Reload geometry when switching between normal and grazing layouts."""
         self._update_direction_controls()
-        if self.root_dir:
+        if self.root_dir and self.root_dir.is_dir():
+            target = self.segmentation_mode_var.get()
+            if target == self.loaded_layout:
+                return
+            self.inactive_results[self.loaded_layout] = self.results
             saved = self.export_config()
-            # The same UID can describe a different cell geometry after a
-            # mode switch, so old contours must not silently move to another
-            # physical strip.
-            saved["results"] = {}
+            saved["results"] = self.inactive_results.pop(target, {})
+            saved["inactive_results"] = dict(self.inactive_results)
             self.load_folder(self.root_dir, saved)
-            mode_label = "掠入射纵向分割" if self._is_grazing_mode() else "正入射网格分割"
-            self.set_status(f"已切换为{mode_label}；旧轮廓结果已清空，请重新处理图像。")
+            self.set_status(f"已切换为{LAYOUT_LABELS[target]}。不同布局分别保留轮廓，不会套用到另一组点位。")
+        elif self.root_dir is not None:
+            # An offline archive can't be resegmented. Do not relabel its saved geometry.
+            self.segmentation_mode_var.set(self.loaded_layout)
+            self._update_direction_controls()
+            self.set_status("原图目录不可用；已保留项目中的布局和轮廓。")
 
     def _is_grazing_mode(self) -> bool:
-        return self.segmentation_mode_var.get() == "grazing"
+        return self.segmentation_mode_var.get() in GRAZING_LAYOUTS
 
     def _direction_values(self) -> tuple[str, str]:
-        return ("TTB", "BTT") if self._is_grazing_mode() else ("LTR", "RTL")
+        return ("TTB", "BTT") if self.segmentation_mode_var.get() == "grazing" else ("LTR", "RTL")
 
     def _update_direction_controls(self) -> None:
         grazing = self._is_grazing_mode()
+        self.layout_menu.configure(text=LAYOUT_LABELS[self.segmentation_mode_var.get()])
         self.direction_box.configure(
             text="每个衰减倍数的序号方向" if grazing else "每个衰减倍数、每一行的打点方向",
         )
         self.direction_tree.heading("#0", text="衰减倍数" if grazing else "行")
-        self.direction_first_button.configure(text="设为上→下" if grazing else "设为左→右")
-        self.direction_second_button.configure(text="设为下→上" if grazing else "设为右→左")
+        first, second = self._direction_values()
+        self.direction_first_button.configure(text=f"设为{DIRECTION_LABELS[first]}")
+        self.direction_second_button.configure(text=f"设为{DIRECTION_LABELS[second]}")
         for button in self.column_order_buttons:
             button.configure(state=tk.DISABLED if grazing else tk.NORMAL)
 
     def load_folder(self, folder: Path, config: dict[str, Any] | None = None) -> None:
+        self.stop_analysis()
         if config:
-            self.segmentation_mode_var.set(str(config.get("segmentation_mode", "normal")))
+            mode = str(config.get("segmentation_mode", "normal"))
+            self.segmentation_mode_var.set(mode if mode in LAYOUT_LABELS else "normal")
+            self.infer_missing_l_var.set(config.get("infer_missing_l", True))
+        self.loaded_layout = self.segmentation_mode_var.get()
+        self.manual_mappings = dict((config or {}).get("manual_mappings", {}))
+        self.inactive_results = dict((config or {}).get("inactive_results", {}))
         self._update_direction_controls()
         self.root_dir = folder
         self.folder_var.set(str(folder))
@@ -559,9 +813,9 @@ class AreaAnalysisPage(ttk.Frame):
         files = sorted((path for path in folder.iterdir() if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS), key=lambda p: natural_key(p.name))
         skipped = 0
         for path in files:
-            entry = parse_image_name(
-                path, folder, self.infer_missing_l_var.get(), self.segmentation_mode_var.get(),
-            )
+            mapping = self.manual_mappings.get(self.loaded_layout, {}).get(path.name)
+            entry = (mapped_image_entry(path, folder, self.loaded_layout, mapping) if mapping else
+                     parse_image_name(path, folder, self.infer_missing_l_var.get(), self.loaded_layout))
             if entry:
                 self.entries.append(entry)
             else:
@@ -574,54 +828,60 @@ class AreaAnalysisPage(ttk.Frame):
             self._apply_config_fields(config)
         self.file_list.delete(0, tk.END)
         for entry in self.entries:
-            self.file_list.insert(tk.END, entry.name)
+            self.file_list.insert(tk.END, entry.name if entry.publish else f"[仅预览] {entry.name}")
         self.refresh_directions()
         if self.entries:
             self.file_list.selection_set(0)
             self.select_entry(self.entries[0])
         else:
+            self.selected_spot_uid = ""
+            self.refresh_spot_tree()
+            self.detail_var.set("")
             self.render_canvas(True)
         self.publish_areas()
-        mode_label = "掠入射纵向分割" if self._is_grazing_mode() else "正入射网格分割"
+        mode_label = LAYOUT_LABELS[self.loaded_layout]
         self.set_status(
             f"以{mode_label}读取 {len(self.entries)} 张目标图像，"
-            f"跳过 {skipped} 张不匹配文件名的图像。"
+            f"跳过 {skipped} 张；文件名缺信息时用“添加/设置点位”。[仅预览]须核实编号后才同步。"
         )
 
     def _recompute_serials(self) -> None:
+        self._applied_column_order = self.column_order_var.get()
         max_col: dict[str, int] = {}
         for entry in self.entries:
-            if entry.layout == "grazing":
+            if entry.layout in GRAZING_LAYOUTS or entry.manual_start is not None:
                 continue
             for spot in entry.spots:
                 max_col[spot.atten] = max(max_col.get(spot.atten, 0), spot.col)
         for entry in self.entries:
-            if entry.layout == "grazing":
+            if entry.layout in GRAZING_LAYOUTS:
                 by_atten: dict[str, list[Spot]] = {}
                 for spot in entry.spots:
                     by_atten.setdefault(spot.atten, []).append(spot)
                 for atten, spots in by_atten.items():
                     range_min = min(spot.col for spot in spots)
                     range_max = max(spot.col for spot in spots)
-                    direction = self.directions.get(self.grazing_direction_key(atten), "TTB")
+                    direction = self.directions.get(self.grazing_direction_key(atten, entry.layout),
+                                                    "TTB" if entry.layout == "grazing" else "LTR")
                     for spot in spots:
                         spot.serial = mapped_grazing_serial(spot.col, range_min, range_max, direction)
                 continue
             for spot in entry.spots:
-                total_cols = max_col.get(spot.atten, spot.col)
+                total_cols = entry.display_cols if entry.manual_start is not None else max_col.get(spot.atten, spot.col)
                 row_direction = self.directions.get(self.direction_key(spot.atten, spot.row), "LTR")
-                spot.serial = mapped_serial(spot.row, spot.col, total_cols, self.column_order_var.get(), row_direction)
+                spot.serial = (entry.manual_start or 1) - 1 + mapped_serial(
+                    spot.row, spot.col, total_cols, self.column_order_var.get(), row_direction)
 
     @staticmethod
     def direction_key(atten: str, row: int) -> str:
         return f"{atten}|{row}"
 
     @staticmethod
-    def grazing_direction_key(atten: str) -> str:
-        return f"grazing|{atten}"
+    def grazing_direction_key(atten: str, layout: str = "grazing") -> str:
+        return f"{layout}|{atten}"
 
     def spot_display_col(self, entry: ImageEntry, spot: Spot) -> int:
-        if entry.layout != "grazing" and self.column_order_var.get() == "RTL":
+        if entry.layout not in GRAZING_LAYOUTS and self.column_order_var.get() == "RTL":
             return entry.display_cols - spot.display_col + 1
         return spot.display_col
 
@@ -634,9 +894,10 @@ class AreaAnalysisPage(ttk.Frame):
                 key=attenuation_sort_key,
             )
             for atten in attens:
-                key = self.grazing_direction_key(atten)
-                direction = self.directions.get(key, "TTB")
-                label = "上→下" if direction == "TTB" else "下→上"
+                key = self.grazing_direction_key(atten, self.loaded_layout)
+                first, second = self._direction_values()
+                direction = self.directions.get(key, first)
+                label = DIRECTION_LABELS[second if direction == second else first]
                 self.direction_tree.insert("", tk.END, iid=key, text=f"{atten}倍衰减", values=(label,))
                 if key in selected_keys:
                     self.direction_tree.selection_add(key)
@@ -652,15 +913,64 @@ class AreaAnalysisPage(ttk.Frame):
                 self.direction_tree.selection_add(key)
                 self.direction_tree.see(key)
 
+    def _physical_bindings(self, order):
+        binding = {}
+        for e in self.entries:
+            if not e.publish:
+                continue
+            for s in e.spots:
+                dc = e.display_cols-s.display_col+1 if order=="RTL" and e.layout=="normal" else s.display_col
+                cell = (e.path,e.display_rows,e.display_cols,s.display_row,dc)
+                binding[cell] = (f"{s.atten}::{s.serial}", s.uid in self.results)
+        return binding
+
+    def _release_renumbered(self, before) -> None:
+        """A user-initiated number swap can legitimately move two files across the same pulse keys."""
+        after = self._physical_bindings(self.column_order_var.get())
+        for cell,(old_key, has_source_result) in before.items():
+            binding = after.get(cell)
+            if binding is None or binding[0] == old_key:
+                continue
+            r = self.state.records.get(old_key)
+            if r is None or not r.image_path or (r.area is not None and not has_source_result):
+                continue
+            if (Path(r.image_path),r.image_display_rows,r.image_display_cols,r.spot_display_row,r.spot_display_col) == cell:
+                self._retire_image_area(r)
+
     def on_column_order_changed(self) -> None:
         if self._is_grazing_mode():
             return
+        before = self._physical_bindings(self._applied_column_order)
+        if self._applied_column_order != self.column_order_var.get():
+            self.stop_analysis()  # In-flight candidates refer to the old physical grid.
+            def mirror(entry, saved):
+                if entry.layout != "normal":
+                    return {}
+                cells = {(s.display_row,s.display_col):s.uid for s in entry.spots}
+                moved = {s.uid: cells[(s.display_row,entry.display_cols-s.display_col+1)] for s in entry.spots}
+                previous = {uid:saved.pop(uid) for uid in moved if uid in saved}
+                saved.update({moved[uid]:value for uid,value in previous.items()})
+                return moved
+
+            for entry in self.entries:
+                moved = mirror(entry, self.results)
+                if self.current_entry is entry:
+                    self.selected_spot_uid = moved.get(self.selected_spot_uid, self.selected_spot_uid)
+                # Legacy mixed folders may show explicit L/R normal images even
+                # inside a grazing workspace. Mirror only those, never genuine strips.
+                for mode, saved in self.inactive_results.items():
+                    if self.root_dir is None or entry.name in self.manual_mappings.get(mode, {}):
+                        continue
+                    other = parse_image_name(entry.path, self.root_dir, self.infer_missing_l_var.get(), mode)
+                    if other and other.layout == "normal":
+                        mirror(other, saved)
         self._recompute_serials()
+        self._release_renumbered(before)
         self.refresh_spot_tree()
         self.render_canvas(True)
         self.publish_areas()
         label = "左→右" if self.column_order_var.get() == "LTR" else "右→左"
-        self.set_status(f"全局 R 列号增长方向已设为 {label}；序号和第 3 步面积对应已重算。建议重新处理已自动识别的图像。")
+        self.set_status(f"全局 R 列号增长方向已设为 {label}；轮廓仍在原物理坑位，序号及面积对应已重算。")
 
     def toggle_direction(self) -> None:
         selected = list(self.direction_tree.selection())
@@ -684,13 +994,15 @@ class AreaAnalysisPage(ttk.Frame):
         self._directions_changed(selected)
 
     def _directions_changed(self, selected: list[str]) -> None:
+        before = self._physical_bindings(self._applied_column_order)
         self._recompute_serials()
+        self._release_renumbered(before)
         self.refresh_directions(selected)
         self.refresh_spot_tree()
         self.redraw_overlay()
         self.publish_areas()
         if self._is_grazing_mode():
-            self.set_status("所选衰减倍数的上/下序号方向及第 3 步面积对应已重算。")
+            self.set_status("所选衰减倍数的坑位序号方向及第 3 步面积对应已重算。")
         else:
             self.set_status("所选行的打点方向、最终序号和第 3 步面积对应已重算。")
 
@@ -723,13 +1035,126 @@ class AreaAnalysisPage(ttk.Frame):
         self.params = ProcessingParameters(
             int(self.gray_low_var.get()), int(self.gray_high_var.get()), bool(self.bright_var.get()),
             float(self.min_area_var.get()), float(self.max_area_var.get()), int(self.blur_var.get()), int(self.close_var.get()),
+            self._method_key(), int(self.gap_var.get()), float(self.sensitivity_var.get()), int(self.pit_gap_var.get()),
         )
+        if not (0 <= self.params.gap_px <= 64 and 0 <= self.params.pit_gap_px <= 64 and 1 <= self.params.sensitivity <= 12):
+            raise ValueError("缺口长度应为 0–64 px，信号门槛应为 1–12。")
+
+    @staticmethod
+    def _locked(result):
+        return (result.get("status") in {"无损伤", "手动轮廓", "手动画"}
+                or (result.get("status") == "图像截断" and not result.get("method")))
+
+    def _cells(self, entry):
+        return [(s.uid, entry.display_rows, entry.display_cols, s.display_row, self.spot_display_col(entry, s))
+                for s in entry.spots]
+
+    def _apply_measurements(self, entry, measurements):
+        for uid, result in measurements.items():
+            if self._locked(self.results.get(uid, {})):
+                continue
+            area = result["area_px"]
+            result["area_um2"] = (area * self.scale_um_per_px**2
+                                  if area is not None and self.scale_um_per_px is not None else None)
+            self.results[uid] = result
+        self.mask_cache.pop(entry.rel_path, None)
+        # Make a reviewed, full-image contour selectable just like a legacy candidate.
+        candidates = []
+        for s in entry.spots:
+            result = self.results.get(s.uid, {})
+            if result.get("status") != "自动" or not result.get("contour"):
+                continue
+            pts = np.asarray(result["contour"], dtype=np.int32)
+            m = cv2.moments(pts)
+            if m["m00"]:
+                candidates.append(Candidate(result["contour"], result["area_px"],
+                    (m["m10"]/m["m00"], m["m01"]/m["m00"]), cv2.boundingRect(pts)))
+        self.candidate_cache[entry.rel_path] = candidates
+
+    def stop_analysis(self):
+        if self._analysis_cancel is not None:
+            self._analysis_cancel.set()
+            self._analysis_cancel = None
+            self.set_status("已停止：已完成图像的结果保留。")
+
+    def _start_analysis(self, entries):
+        """One worker processes native pixels; only the Tk thread updates project state."""
+        self.stop_analysis()
+        method, gap, sensitivity = self.params.method, self.params.gap_px, self.params.sensitivity
+        pit_gap = self.params.pit_gap_px
+        jobs = []
+        for entry in entries:
+            if (method == "dic" and entry.layout == "normal") or (method == "pit" and entry.layout != "normal"):
+                continue
+            grid = self._cells(entry)
+            cells = [cell for cell in grid if not self._locked(self.results.get(cell[0], {}))]
+            jobs.append((entry, grid, cells))
+        if not jobs:
+            self.set_status("方法与当前点位排布不匹配。明暗坑用于正入射网格，DIC 用于掠入射条带。")
+            return
+        cancelled = self._analysis_cancel = threading.Event()
+        messages = queue.SimpleQueue()
+        skipped = len(entries) - len(jobs)
+        counts = {"自动": 0, "待复核": 0, "图像截断": 0, "未检出": 0}
+
+        def work():
+            try:
+                for index, (entry, grid, cells) in enumerate(jobs, 1):
+                    if cancelled.is_set():
+                        return
+                    messages.put(("progress", f"正在识别 {index}/{len(jobs)}：{entry.name}"))
+                    local_gap = pit_gap if resolve_method(method, entry.layout) == "pit" else gap
+                    results = measure_image(entry.path, entry.layout, cells, method, local_gap, sensitivity, cancelled.is_set)
+                    messages.put(("result", (entry, grid, results)))
+                messages.put(("done", None))
+            except Exception as exc:
+                messages.put(("error", f"{entry.name}：{exc}"))
+
+        def poll():
+            if cancelled.is_set() or self._analysis_cancel is not cancelled:
+                return
+            while not messages.empty():
+                typ, value = messages.get()
+                if typ == "progress":
+                    self.set_status(value)
+                elif typ == "result":
+                    entry, grid, results = value
+                    if not any(e is entry for e in self.entries) or self._cells(entry) != grid:
+                        self.stop_analysis()
+                        return
+                    self._apply_measurements(entry, results)
+                    for uid, result in results.items():
+                        if self.results.get(uid) is result:
+                            key = result["status"]
+                            counts[key] = counts.get(key, 0) + 1
+                    if self.current_entry is entry:
+                        self.refresh_spot_tree()
+                        self.render_canvas(True)
+                    self.publish_areas()
+                elif typ == "error":
+                    self._analysis_cancel = None
+                    self.set_status("处理失败；先前已完成图像的结果保留。")
+                    messagebox.showerror("处理失败", value, parent=self)
+                    return
+                elif typ == "done":
+                    self._analysis_cancel = None
+                    report = "，".join(f"{k} {n}" for k, n in counts.items())
+                    self.set_status(f"识别完成：{report}；跳过 {skipped} 张其他排布的图像。人工结果保留。")
+                    return
+            self.after(60, poll)
+
+        threading.Thread(target=work, daemon=True, name="xfel-area").start()
+        self.after(0, poll)
 
     def process_current(self) -> None:
         if not self.current_entry:
             return
         try:
             self.sync_params()
+            if self.params.method != "threshold":
+                self._start_analysis([self.current_entry])
+                return
+            self.stop_analysis()
             self.process_entry(self.current_entry)
         except Exception as exc:
             messagebox.showerror("处理失败", str(exc), parent=self)
@@ -737,13 +1162,17 @@ class AreaAnalysisPage(ttk.Frame):
         self.refresh_spot_tree()
         self.render_canvas(True)
         self.publish_areas()
-        self.set_status(f"已处理：{self.current_entry.name}，面积已同步到第 3 步。")
+        self.set_status(f"已处理：{self.current_entry.name}。" + ("面积已同步到第 3 步。" if self.current_entry.publish else "仅供预览，未同步到能量表。"))
 
     def process_all(self) -> None:
         if not self.entries:
             return
         try:
             self.sync_params()
+            if self.params.method != "threshold":
+                self._start_analysis(list(self.entries))
+                return
+            self.stop_analysis()
             for index, entry in enumerate(self.entries, 1):
                 self.set_status(f"正在处理 {index}/{len(self.entries)}：{entry.name}")
                 self.process_entry(entry)
@@ -755,7 +1184,7 @@ class AreaAnalysisPage(ttk.Frame):
         self.refresh_spot_tree()
         self.render_canvas(True)
         self.publish_areas()
-        self.set_status(f"已处理全部 {len(self.entries)} 张图像，面积已同步到第 3 步。")
+        self.set_status(f"已处理全部 {len(self.entries)} 张图像，仅同步已核实编号的点位。")
 
     def process_entry(self, entry: ImageEntry) -> None:
         image = self.load_image(entry)
@@ -766,7 +1195,7 @@ class AreaAnalysisPage(ttk.Frame):
         used: set[int] = set()
         for spot in entry.spots:
             current = self.results.get(spot.uid, {})
-            if current.get("status") in {"无损伤", "图像截断", "手动轮廓", "手动画"}:
+            if self._locked(current):
                 continue
             display_col = self.spot_display_col(entry, spot)
             x0 = (display_col - 1) * width / entry.display_cols
@@ -801,12 +1230,48 @@ class AreaAnalysisPage(ttk.Frame):
     def _spot_select(self, _event=None) -> None:
         selection = self.spot_tree.selection()
         self.selected_spot_uid = selection[0] if selection else ""
+        result = self.results.get(self.selected_spot_uid, {})
+        reason = result.get("diagnostics", {}).get("reason", "")
+        label = METHODS.get(result.get("method"), result.get("status", ""))
+        self.detail_var.set(f"{label} · {reason}" if reason else label)
         self.redraw_overlay()
 
     def selected_spot(self) -> Spot | None:
         if not self.current_entry:
             return None
         return next((spot for spot in self.current_entry.spots if spot.uid == self.selected_spot_uid), None)
+
+    def edit_selected_contour(self) -> None:
+        from contour_editor import OutlineDraft, edit_outline
+
+        entry, spot = self.current_entry, self.selected_spot()
+        if not entry or not spot:
+            messagebox.showinfo("未选择坑位", "请先选择需要修正的坑位。", parent=self)
+            return
+        if self._analysis_cancel is not None:
+            messagebox.showinfo("正在处理", "请先停止批处理或等待处理完成，再修正轮廓。", parent=self)
+            return
+        uid = spot.uid
+        result = self.results.get(uid, {})
+        rgb = self.load_image(entry)
+        bounds = spot_bounds(*rgb.shape[:2], entry.display_rows, entry.display_cols,
+                             spot.display_row, self.spot_display_col(entry, spot))
+        try:
+            draft = OutlineDraft(result, bounds)
+        except ValueError as exc:
+            messagebox.showinfo("没有可修边界", str(exc), parent=self)
+            return
+
+        def accept(points):
+            if self.current_entry is not entry or self.selected_spot_uid != uid or self.results.get(uid) is not result:
+                raise ValueError("项目、点位或原识别结果已变化，草稿不能写回，请取消后重新打开。")
+            area = abs(cv2.contourArea(np.asarray(points, dtype=np.int32)))
+            updated = self._result(points, area, "手动画")
+            updated["reviewed_from"] = result.get("method", result.get("status"))
+            self.results[uid] = updated
+            self._changed_area()
+
+        edit_outline(self, rgb, draft, f"{entry.name} · {spot.atten}倍 no.{spot.serial}", accept)
 
     def mark_no_damage(self) -> None:
         spot = self.selected_spot()
@@ -836,14 +1301,60 @@ class AreaAnalysisPage(ttk.Frame):
         self.redraw_overlay()
         self.publish_areas()
 
+    @staticmethod
+    def _retire_image_area(record) -> None:
+        record.area = record.area_px = record.contour = None
+        record.area_status = "未处理"
+        record.image_path = record.image_rel_path = ""
+        record.image_display_rows = record.image_display_cols = record.spot_display_row = record.spot_display_col = None
+
     def publish_areas(self) -> None:
         chosen: dict[tuple[str, int], dict[str, Any]] = {}
+        conflicts: set[tuple[str, int]] = set()
+        kept: set[tuple[str,int]] = set()
+        source_cells: dict[Path, set[tuple[str,int]]] = {}
+        measured_sources: set[Path] = set()
         priority = {"手动画": 4, "手动轮廓": 4, "无损伤": 4, "图像截断": 4,
-                    "自动": 3, "未检出": 2, "未处理": 1}
+                    "自动": 3, "待复核": 2, "未检出": 2, "未处理": 1}
         for entry in self.entries:
+            if not entry.publish:
+                continue
+            occupied = {(s.display_row, self.spot_display_col(entry,s)) for s in entry.spots
+                        if self.results.get(s.uid, {}).get("status", "未处理") != "未处理"}
             for spot in entry.spots:
+                key = (spot.atten, spot.serial)
+                source_cells.setdefault(entry.path, set()).add(key)
+                previous = self.state.records.get(f"{spot.atten}::{spot.serial}")
                 result = self.results.get(spot.uid, {})
                 status = result.get("status", "未处理")
+                if previous is not None:
+                    # Entering a layout is not a new observation: preserve
+                    # even a manually entered Step 3 area without an image.
+                    if status == "未处理" and (previous.area is not None or previous.image_path):
+                        old_cell = (previous.spot_display_row, previous.spot_display_col)
+                        moved_number = (previous.image_path and Path(previous.image_path) == entry.path and
+                                        (previous.image_display_rows, previous.image_display_cols) ==
+                                        (entry.display_rows, entry.display_cols) and old_cell in occupied and
+                                        old_cell != (spot.display_row, self.spot_display_col(entry,spot)))
+                        if not moved_number:
+                            if (previous.area is not None and
+                                (previous.image_display_rows, previous.image_display_cols) !=
+                                (entry.display_rows, entry.display_cols)):
+                                kept.add(key)
+                            continue
+                    if previous.image_path and Path(previous.image_path) != entry.path:
+                        conflicts.add(key)
+                        continue
+                    previous_grid = (previous.image_display_rows, previous.image_display_cols)
+                    if (previous.image_path and previous.area is not None and
+                        previous_grid != (entry.display_rows, entry.display_cols) and
+                        (status in {"待复核", "未检出"} or (status == "图像截断" and "method" in result))):
+                        # Merely trying a different grid which has no measurable
+                        # footprint must not erase the already accepted measurement.
+                        kept.add(key)
+                        continue
+                if status in {"手动画", "手动轮廓", "自动", "无损伤"} or (status == "图像截断" and "method" not in result):
+                    measured_sources.add(entry.path)
                 value = result.get("area_um2") if self.scale_um_per_px is not None else result.get("area_px")
                 item = {
                     "atten": spot.atten, "serial": spot.serial, "area": value, "area_px": result.get("area_px"),
@@ -852,9 +1363,18 @@ class AreaAnalysisPage(ttk.Frame):
                     "spot_display_row": spot.display_row, "spot_display_col": self.spot_display_col(entry, spot),
                     "contour": result.get("contour"),
                 }
-                key = (spot.atten, spot.serial)
                 if key not in chosen or priority.get(status, 0) > priority.get(chosen[key]["status"], 0):
                     chosen[key] = item
+        # An accepted rebind of the same file to a different serial range
+        # retires only obsolete image/area fields, never its pulse data.
+        for r in self.state.records.values():
+            if not r.image_path:
+                continue
+            path = Path(r.image_path)
+            if path in measured_sources and (r.atten, r.serial) not in source_cells[path]:
+                self._retire_image_area(r)
+        self._sync_conflicts = conflicts
+        self._sync_kept = len(kept - chosen.keys())
         unit = "µm²" if self.scale_um_per_px is not None else "px²"
         self.state.merge_area_records(chosen.values(), unit)
 
@@ -988,12 +1508,19 @@ class AreaAnalysisPage(ttk.Frame):
                 points = [coordinate for point in contour for coordinate in self._to_canvas((point[0], point[1]))]
                 if len(points) >= 6:
                     self.canvas.create_line(*points, *points[:2], fill=color, width=contour_width, tags="overlay")
+            if self.show_contours_var.get():
+                for kind in ("paths", "bridges"):
+                    for path in result.get(kind, ()):
+                        points = [v for p in path for v in self._to_canvas(p)]
+                        if len(points) >= 4:
+                            self.canvas.create_line(*points, fill="#fef08a", width=contour_width,
+                                                    dash=(5, 3), tags="overlay")
             display_col = self.spot_display_col(entry, spot)
             x = (display_col - 1) * width / entry.display_cols + 8
             y = (spot.display_row - 1) * height / entry.display_rows + 8
             value = result.get("area_um2") if self.scale_um_per_px is not None else result.get("area_px")
             suffix = "µm²" if self.scale_um_per_px is not None else "px²"
-            text = f"{spot.atten}倍 no.{spot.serial}" + (f"\n{value:.5g} {suffix}" if value is not None else "")
+            text = f"{spot.atten}倍 no.{spot.serial}" + (f"\n{value:.5g} {suffix}" if value is not None else "\n" + result.get("status", ""))
             tx, ty = self._to_canvas((x, y))
             label_color = self._valid_color(self.selected_color_var, "#f59e0b") if selected else self._valid_color(self.label_color_var, "#22c55e")
             self.canvas.create_text(round(tx), round(ty), text=text, anchor=tk.NW, fill=label_color, font=self.annotation_font, tags="overlay")
@@ -1112,9 +1639,18 @@ class AreaAnalysisPage(ttk.Frame):
             return
         if self.current_entry.rel_path not in self.candidate_cache:
             self.sync_params()
-            self.process_entry(self.current_entry)
+            if self.params.method != "threshold":
+                self._apply_measurements(self.current_entry, {})
+            else:
+                self.process_entry(self.current_entry)
         best: tuple[float, Candidate] | None = None
+        bounds = spot_bounds(*self.load_image(self.current_entry).shape[:2],
+                             self.current_entry.display_rows, self.current_entry.display_cols,
+                             spot.display_row, self.spot_display_col(self.current_entry, spot))
+        x0, y0, x1, y1 = bounds
         for candidate in self.candidate_cache.get(self.current_entry.rel_path, []):
+            if not (x0 <= candidate.centroid[0] < x1 and y0 <= candidate.centroid[1] < y1):
+                continue
             contour = np.asarray(candidate.contour, dtype=np.int32).reshape(-1, 1, 2)
             inside = cv2.pointPolygonTest(contour, (float(point[0]), float(point[1])), False)
             distance = 0.0 if inside >= 0 else math.dist(point, candidate.centroid)
@@ -1160,9 +1696,17 @@ class AreaAnalysisPage(ttk.Frame):
         self._changed_area()
 
     def _recompute_scaled_areas(self) -> None:
-        for result in self.results.values():
-            area_px = result.get("area_px")
-            result["area_um2"] = area_px * self.scale_um_per_px**2 if area_px is not None and self.scale_um_per_px is not None else None
+        factor = self.scale_um_per_px**2 if self.scale_um_per_px is not None else None
+        for group in (self.results, *self.inactive_results.values()):
+            for result in group.values():
+                area_px = result.get("area_px")
+                result["area_um2"] = area_px * factor if area_px is not None and factor is not None else None
+        # Active geometry is published below; also rescale previously verified
+        # sources from this same directory that are not in the current layout.
+        for record in self.state.records.values():
+            if record.image_path and Path(record.image_path).parent == self.root_dir and record.area_px is not None:
+                record.area = record.area_px * factor if factor is not None else record.area_px
+                record.area_unit = "µm²" if factor is not None else "px²"
 
     def export_excel(self) -> None:
         if not self.state.records:
@@ -1197,13 +1741,17 @@ class AreaAnalysisPage(ttk.Frame):
     def export_config(self) -> dict[str, Any]:
         return {
             "folder": str(self.root_dir) if self.root_dir else "",
-            "params": asdict(self.params),
+            "params": {**asdict(self.params), "method": self._method_key(),
+                       "gap_px": self.gap_var.get(), "pit_gap_px": self.pit_gap_var.get(),
+                       "sensitivity": self.sensitivity_var.get()},
             "scale_um_per_px": self.scale_um_per_px,
             "scale_line": self.scale_line,
             "scale_length": self.scale_length_var.get(),
             "results": self.results,
             "directions": self.directions,
             "segmentation_mode": self.segmentation_mode_var.get(),
+            "manual_mappings": self.manual_mappings,
+            "inactive_results": self.inactive_results,
             "column_order": self.column_order_var.get(),
             "infer_missing_l": self.infer_missing_l_var.get(),
             "show_contours": self.show_contours_var.get(),
@@ -1226,6 +1774,11 @@ class AreaAnalysisPage(ttk.Frame):
         self.max_area_var.set(self.params.max_area_px)
         self.blur_var.set(self.params.median_blur)
         self.close_var.set(self.params.close_kernel)
+        self.method_var.set(METHODS.get(self.params.method, METHODS["threshold"]))
+        self.gap_var.set(self.params.gap_px)
+        self.pit_gap_var.set(self.params.pit_gap_px)
+        self.sensitivity_var.set(self.params.sensitivity)
+        self._method_changed()
         scale_data = data.get("scale", {})
         self.scale_um_per_px = data.get("scale_um_per_px", scale_data.get("um_per_px"))
         line = data.get("scale_line", scale_data.get("line"))
@@ -1233,7 +1786,7 @@ class AreaAnalysisPage(ttk.Frame):
         self.scale_length_var.set(data.get("scale_length", scale_data.get("actual_um", 80.0)))
         raw_results = dict(data.get("results", {}))
         current_uids = {spot.uid for entry in self.entries for spot in entry.spots}
-        if raw_results and not any(uid in current_uids for uid in raw_results):
+        if current_uids and raw_results and not any(uid in current_uids for uid in raw_results):
             converted: dict[str, dict[str, Any]] = {}
             for entry in self.entries:
                 for index, spot in enumerate(entry.spots, 1):
@@ -1264,11 +1817,32 @@ class AreaAnalysisPage(ttk.Frame):
             self.scale_info.configure(text=f"{self.scale_um_per_px:.7g} µm/px；面积系数 {self.scale_um_per_px**2:.7g} µm²/px²")
 
     def import_config(self, data: dict[str, Any]) -> None:
+        self.stop_analysis()
+        self._sync_conflicts.clear()
+        self._sync_kept = 0
         folder_text = data.get("folder", "")
-        self.segmentation_mode_var.set(str(data.get("segmentation_mode", "normal")))
+        mode = str(data.get("segmentation_mode", "normal"))
+        self.segmentation_mode_var.set(mode if mode in LAYOUT_LABELS else "normal")
+        self.loaded_layout = self.segmentation_mode_var.get()
+        self.manual_mappings = dict(data.get("manual_mappings", {}))
+        self.inactive_results = dict(data.get("inactive_results", {}))
         self._update_direction_controls()
         self.infer_missing_l_var.set(data.get("infer_missing_l", True))
         if folder_text and Path(folder_text).is_dir():
             self.load_folder(Path(folder_text), data)
         else:
+            self.root_dir = Path(folder_text) if folder_text else None
+            self.entries.clear()
+            self.current_entry = None
+            self.directions = dict(data.get("directions", {}))
+            self.column_order_var.set(data.get("column_order", "LTR"))
+            self.folder_var.set(folder_text)
+            self.file_list.delete(0, tk.END)
+            self.image_cache.clear()
+            self.candidate_cache.clear()
+            self.mask_cache.clear()
+            self.selected_spot_uid = ""
+            self.refresh_directions()
+            self.refresh_spot_tree()
+            self.render_canvas(True)
             self._apply_config_fields(data)

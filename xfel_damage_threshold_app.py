@@ -1,4 +1,4 @@
-"""Integrated three-step XFEL single-pulse damage threshold application."""
+"""Integrated four-step XFEL single-pulse damage threshold application."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from xfel_core import ProjectState, RecentPathStore, load_json, save_json
 APP_DIR = Path(__file__).resolve().parent
 USER_CONFIG = APP_DIR / ".xfel_integrated_config.json"
 DIALOG_PATHS_CONFIG = APP_DIR / ".xfel_dialog_paths.json"
-PROJECT_VERSION = 21
+PROJECT_VERSION = 22
 
 
 class XFELDamageThresholdApp(tk.Tk):
@@ -127,13 +127,8 @@ class XFELDamageThresholdApp(tk.Tk):
             return
         self.project_path = None
         self.state.load_dict({}, notify=False)
-        self.area_page.root_dir = None
-        self.area_page.entries.clear()
-        self.area_page.current_entry = None
-        self.area_page.results.clear()
-        self.area_page.folder_var.set("")
-        self.area_page.file_list.delete(0, tk.END)
-        self.area_page.render_canvas(True)
+        self.area_page.stop_analysis()
+        self.area_page.import_config({})
         self.calibration_page.import_config({})
         self.energy_page.import_config({})
         self.threshold_page.import_config({})
